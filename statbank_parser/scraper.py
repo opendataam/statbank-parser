@@ -1,319 +1,608 @@
+import csv
+import json
+import logging
+import math
+from copy import copy, deepcopy
+from io import BytesIO, StringIO
+from urllib.parse import quote, unquote, urljoin, urlparse
+
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
-from urllib.parse import urljoin, urlparse, parse_qs
-import logging
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class StatbankScraper:
-    BASE_URL = "https://statbank.armstat.am/pxweb/en/ArmStatBank/"
 
-    def __init__(self):
+class StatbankScraper:
+    BASE_URL = 'https://statbank.armstat.am/pxweb/en/ArmStatBank/'
+    DEFAULT_TIMEOUT = (10, 60)
+    FORMAT_ALIASES = {
+        'csv': 'Comma delimited with heading',
+        'px': 'PX-file',
+        'excel': 'Excel (xlsx)',
+        'excel-xlsx': 'Excel (xlsx)',
+        'excel-xml': 'Excel workbook (xml)',
+        'json': 'Json file (json)',
+        'json-stat': 'JSON-stat file (json)',
+        'json-stat2': 'JSON-stat 2 file (json)',
+        'html': 'Html file (htm)',
+        'html5': 'Html5 table (htm)',
+    }
+
+    def __init__(self, timeout=DEFAULT_TIMEOUT):
+        self.timeout = timeout
         self.session = requests.Session()
+        retries = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(('GET', 'POST')),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
 
     def get_indicators(self):
-        """
-        Traverses the category tree to find all tables.
-        Returns a list of dictionaries with 'id', 'title', 'url', 'topic', 'subtopics'.
-        """
+        """Return all tables with unique URLs and their category hierarchy."""
         self.visited = set()
-        return self._traverse_category(self.BASE_URL, [])
+        items = self._traverse_category(self.BASE_URL, [])
+        unique_items = []
+        seen_urls = set()
+        for item in items:
+            if item['url'] in seen_urls:
+                continue
+            seen_urls.add(item['url'])
+            unique_items.append(item)
+        return unique_items
 
-    def _traverse_category(self, url, breadcrumbs):
+    def _traverse_category(self, url, breadcrumbs, node_path='ArmStatBank'):
         if url in self.visited:
             return []
         self.visited.add(url)
-        
-        logger.info(f"Visiting category: {url}")
-        items = []
-        
-        try:
-            response = self.session.get(url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find the main content area
-            content_area = soup.find('div', id='pxwebcontent')
-            if not content_area:
-                 # Fallback to body if specific container not found
-                 logger.warning("Could not find pxwebcontent, using body")
-                 content_area = soup.body
 
-            links = content_area.find_all('a')
-            logger.info(f"Found {len(links)} links in content area")
-            
-            for link in links:
-                href = link.get('href', '')
-                text = link.get_text(strip=True)
-                # logger.info(f"Checking link: {text} -> {href}")
-                
-                if not href:
+        logger.info('Visiting category: %s', url)
+        response = self.session.get(url, timeout=self.timeout)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        content_area = soup.find('div', id='pxwebcontent')
+        if not content_area:
+            content_area = soup.body
+        if not content_area:
+            raise ValueError(f'Could not find page content for {url}')
+
+        links = content_area.find_all('a')
+        logger.info('Found %d links in content area', len(links))
+        items = []
+        current_path = unquote(urlparse(url).path).rstrip('/')
+
+        for link in links:
+            href = link.get('href', '')
+            text = link.get_text(strip=True)
+            if not href:
+                continue
+
+            if href.lower().endswith(('.px', '.px/')):
+                full_url = urljoin(url, href)
+                table_path = unquote(urlparse(full_url).path).rstrip('/')
+                if table_path.rsplit('/', 1)[0] != current_path:
                     continue
 
-                if href.lower().endswith('.px') or href.lower().endswith('.px/'):
-                    # It's a table
-                    full_url = urljoin(url, href)
-                    
-                    # Extract ID from URL
-                    # Example: .../EF-NA-01.px/ -> EF-NA-01
-                    path = urlparse(full_url).path
-                    filename = path.split('/')[-1]
-                    if not filename: # Handle trailing slash
-                        filename = path.split('/')[-2]
-                    
-                    table_id = filename.replace('.px', '')
-                    
-                    # Topic is the first breadcrumb, subtopics are the rest
-                    topic = breadcrumbs[0] if breadcrumbs else ""
-                    subtopics = breadcrumbs[1:] if len(breadcrumbs) > 1 else []
+                filename = table_path.rsplit('/', 1)[-1]
+                table_id = filename.rsplit('.', 1)[0]
+                items.append({
+                    'id': table_id,
+                    'title': text,
+                    'url': full_url,
+                    'topic': breadcrumbs[0] if breadcrumbs else '',
+                    'subtopics': breadcrumbs[1:],
+                })
+            elif 'javascript:__doPostBack' in href:
+                args = href.split("'")
+                if len(args) < 4:
+                    continue
+                target = args[1]
+                argument = args[3]
+                if 'MenuNavigationTree' not in target:
+                    continue
 
-                    items.append({
-                        'id': table_id,
-                        'title': text,
-                        'url': full_url,
-                        'topic': topic,
-                        'subtopics': subtopics
-                    })
-                elif 'javascript:__doPostBack' in href:
-                    # Parse PostBack to construct URL
-                    try:
-                        args = href.split("'")
-                        if len(args) >= 4:
-                            target = args[1]
-                            argument = args[3]
-                            
-                            # We only care about navigation tree postbacks
-                            if 'MenuNavigationTree' in target:
-                                # The argument is like: pArmStatBank__1 ...\\ArmStatBank__1 ...
-                                # We take the last part
-                                parts = argument.split('\\\\') # It's escaped in JS, so might be \\ or \
-                                if len(parts) == 1:
-                                     parts = argument.split('\\')
-                                
-                                last_part = parts[-1]
-                                
-                                # Remove leading 'p' if it exists (seems to be a prefix for nodes)
-                                # But be careful, 'p' might be part of the name? 
-                                # Looking at examples: 'pArmStatBank__1...' -> 'ArmStatBank__1...'
-                                # So yes, remove first char if it is 'p' and the rest matches the pattern
-                                if last_part.startswith('p') and 'ArmStatBank' in last_part:
-                                     last_part = last_part[1:]
-                                
-                                # Construct new URL
-                                # The base seems to be constant: https://statbank.armstat.am/pxweb/en/ArmStatBank/
-                                # And we append the node ID.
-                                # Wait, the node ID is the full path?
-                                # Example: ArmStatBank__1 Econnomy and finance__15 National Accounts
-                                # Yes, it seems to be the full path relative to ArmStatBank/
-                                
-                                # URL Encode
-                                import urllib.parse
-                                encoded_part = urllib.parse.quote(last_part)
-                                
-                                new_url = f"https://statbank.armstat.am/pxweb/en/ArmStatBank/{encoded_part}"
-                                
-                                # Update breadcrumbs
-                                # The text of the link is the new category name
-                                new_breadcrumbs = breadcrumbs + [text]
-                                
-                                # Recurse
-                                items.extend(self._traverse_category(new_url, new_breadcrumbs))
-                    except Exception as e:
-                        logger.warning(f"Failed to parse PostBack: {href} - {e}")
-                elif 'ArmStatBank' in href and href.startswith('http'):
-                     # It might be a direct link to a sub-category (like in the breadcrumbs or main list if they changed it)
-                     # But we should be careful not to go back up (breadcrumbs)
-                     # Breadcrumbs usually have distinct classes or IDs, but here we just check if it's longer?
-                     pass
+                parts = argument.split('\\\\')
+                if len(parts) == 1:
+                    parts = argument.split('\\')
+                last_part = parts[-1]
+                if last_part.startswith('pArmStatBank'):
+                    last_part = last_part[1:]
 
-            return items
+                path_parts = last_part.rsplit('__', 1)
+                if len(path_parts) != 2:
+                    raise ValueError(f'Invalid navigation path: {last_part}')
+                if path_parts[0] != node_path:
+                    continue
 
-        except Exception as e:
-            logger.error(f"Error traversing {url}: {e}")
-            return []
+                new_url = f'{self.BASE_URL}{quote(last_part)}'
+                items.extend(self._traverse_category(
+                    new_url,
+                    breadcrumbs + [text],
+                    node_path=last_part,
+                ))
+
+        return items
 
     def get_available_formats(self, table_url):
-        """
-        Gets the list of available file formats for a table.
-        Returns a list of format names.
-        """
-        logger.info(f"Fetching available formats for: {table_url}")
-        
-        # 1. Get the initial page
-        response = self.session.get(table_url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        form = soup.find('form', id='aspnetForm')
-        if not form:
-            raise Exception("Could not find aspnetForm")
-
-        viewstate = soup.find('input', id='__VIEWSTATE')['value']
-        eventvalidation = soup.find('input', id='__EVENTVALIDATION')['value']
-        
-        data = {
-            '__VIEWSTATE': viewstate,
-            '__EVENTVALIDATION': eventvalidation,
-        }
-        
-        button = soup.find('input', {'type': 'submit', 'value': 'Continue'})
-        if not button:
-             button = soup.find('input', {'type': 'submit', 'value': 'Show table'})
-        if not button:
-             button = soup.find('input', {'type': 'submit', 'class': 'pxweb-btn-action'})
-        
-        if button:
-            data[button['name']] = button['value']
-        else:
-             # Fallback
-             data['ctl00$ContentPlaceHolderMain$VariableSelector1$VariableSelector1$ButtonViewTable'] = 'Show table'
-
-        # Select all options for each listbox
-        selects = soup.find_all('select')
-        for select in selects:
-            name = select['name']
-            options = [opt['value'] for opt in select.find_all('option')]
-            data[name] = options
-            
-        # Post to get the result page
-        post_response = self.session.post(table_url, data=data)
-        post_response.raise_for_status()
-        
-        result_soup = BeautifulSoup(post_response.content, 'html.parser')
-        
-        # Find all format labels
-        formats = []
-        labels = result_soup.find_all('label')
-        for label in labels:
-            if 'SaveAsRadioButtonList' in label.get('for', ''):
-                formats.append(label.get_text(strip=True))
-        
-        return formats
+        """Return the file formats available for a table."""
+        logger.info('Fetching available formats for: %s', table_url)
+        _, result_soup = self._get_table_result(table_url)
+        return [label for label, _ in self._get_format_options(result_soup)]
 
     def get_table_data(self, table_url, file_format=None):
-        """
-        Fetches data for a specific table URL.
-        If file_format is provided, downloads the file in that format.
-        Supported formats: 'excel', 'csv', 'json', 'px', etc. (matches text in dropdown)
-        """
-        logger.info(f"Fetching data for: {table_url} (Format: {file_format})")
-        
-        # 1. Get the initial page to extract ViewState and Options
-        response = self.session.get(table_url)
+        """Return a complete DataFrame or the bytes of a selected file format."""
+        logger.info('Fetching data for: %s (Format: %s)', table_url, file_format)
+        post_response, result_soup = self._get_table_result(table_url)
+        if self._get_format_options(result_soup):
+            content = self._download_format(
+                post_response,
+                result_soup,
+                file_format or 'csv',
+            )
+        else:
+            content = self._get_large_table_data(table_url, file_format or 'csv')
+        if file_format:
+            return content
+        return pd.read_csv(
+            BytesIO(content),
+            skiprows=2,
+            encoding='utf-8-sig',
+        )
+
+    def _get_table_page(self, table_url):
+        response = self.session.get(table_url, timeout=self.timeout)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
-        
-        form = soup.find('form', id='aspnetForm')
-        if not form:
-            raise Exception("Could not find aspnetForm")
+        if not soup.find('form', id='aspnetForm'):
+            raise ValueError('Could not find aspnetForm')
+        if not soup.find('input', id='__VIEWSTATE') or not soup.find('input', id='__EVENTVALIDATION'):
+            raise ValueError('Could not find ASP.NET form state')
+        return response, soup
 
-        viewstate = soup.find('input', id='__VIEWSTATE')['value']
-        eventvalidation = soup.find('input', id='__EVENTVALIDATION')['value']
-        
+    def _get_table_result(self, table_url):
+        response, soup = self._get_table_page(table_url)
         data = {
-            '__VIEWSTATE': viewstate,
-            '__EVENTVALIDATION': eventvalidation,
+            '__VIEWSTATE': soup.find('input', id='__VIEWSTATE')['value'],
+            '__EVENTVALIDATION': soup.find('input', id='__EVENTVALIDATION')['value'],
         }
-        
         button = soup.find('input', {'type': 'submit', 'value': 'Continue'})
         if not button:
-             button = soup.find('input', {'type': 'submit', 'value': 'Show table'})
+            button = soup.find('input', {'type': 'submit', 'value': 'Show table'})
         if not button:
-             button = soup.find('input', {'type': 'submit', 'class': 'pxweb-btn-action'})
-        
+            button = soup.find('input', {'type': 'submit', 'class': 'pxweb-btn-action'})
+
         if button:
             data[button['name']] = button['value']
         else:
-             data['ctl00$ContentPlaceHolderMain$VariableSelector1$VariableSelector1$ButtonViewTable'] = 'Show table'
+            data['ctl00$ContentPlaceHolderMain$VariableSelector1$VariableSelector1$ButtonViewTable'] = 'Show table'
 
-        # Select all options for each listbox
-        selects = soup.find_all('select')
-        for select in selects:
-            name = select['name']
-            options = [opt['value'] for opt in select.find_all('option')]
-            data[name] = options
-            
-        # 3. Post the form to get the table view
-        post_response = self.session.post(table_url, data=data)
+        for select in soup.find_all('select'):
+            if not select.get('name'):
+                continue
+            data[select['name']] = [
+                option['value']
+                for option in select.find_all('option')
+                if option.has_attr('value')
+            ]
+
+        post_response = self.session.post(
+            response.url,
+            data=data,
+            timeout=self.timeout,
+        )
         post_response.raise_for_status()
-        
-        if not file_format:
-            # Default behavior: Parse HTML table
-            result_soup = BeautifulSoup(post_response.content, 'html.parser')
-            table = result_soup.find('table', {'class': 'pxweb-table'})
-            
-            if not table:
-                tables = pd.read_html(post_response.content)
-                if tables:
-                    return tables[0]
-                else:
-                    raise Exception("No table found in response")
-            
-            df = pd.read_html(str(table))[0]
-            return df
-        else:
-            # Download specific format
-            # We are now on the result page. We need to find the "Save as" options.
-            result_soup = BeautifulSoup(post_response.content, 'html.parser')
-            
-            # Find the radio button list
-            # Usually id ends with SaveAsRadioButtonList
-            # We need to map the requested format to the radio button value
-            
-            # Debug: Log all inputs
-            inputs = result_soup.find_all('input')
-            for inp in inputs:
-                logger.info(f"Input: name={inp.get('name')}, id={inp.get('id')}, value={inp.get('value')}")
-            
-            # Common mapping based on text
-            # We'll try to find the label containing the requested format text
-            labels = result_soup.find_all('label')
-            target_value = None
-            
-            # Normalize format string
-            fmt_lower = file_format.lower()
-            
-            for label in labels:
-                label_text = label.get_text(strip=True).lower()
-                if fmt_lower in label_text:
-                    # Found a match, get the input ID
-                    input_id = label.get('for')
-                    if input_id:
-                        inp = result_soup.find('input', id=input_id)
-                        if inp:
-                            target_value = inp['value']
-                            break
-            
-            if not target_value:
-                # Fallback: try to match exact values if known or list available
-                logger.warning(f"Could not find format matching '{file_format}'. Available options:")
-                available = []
-                for label in labels:
-                     if 'SaveAsRadioButtonList' in label.get('for', ''):
-                         available.append(label.get_text(strip=True))
-                logger.warning(available)
-                raise Exception(f"Format '{file_format}' not found.")
+        return post_response, BeautifulSoup(post_response.content, 'html.parser')
 
-            # Prepare data for the second POST (Download)
-            # We need new ViewState from the result page
-            viewstate2 = result_soup.find('input', id='__VIEWSTATE')['value']
-            eventvalidation2 = result_soup.find('input', id='__EVENTVALIDATION')['value']
-            
-            download_data = {
-                '__VIEWSTATE': viewstate2,
-                '__EVENTVALIDATION': eventvalidation2,
-                'ctl00$ctl00$ContentPlaceHolderMain$CommandBar1$CommandBar1$SaveAsRadioButtonList': target_value,
-                'ctl00$ctl00$ContentPlaceHolderMain$CommandBar1$CommandBar1$SaveAsBtn': 'Save result as...' 
+    @staticmethod
+    def _get_form_data(soup):
+        data = {}
+        for field in soup.find_all('input', type='hidden'):
+            if field.get('name'):
+                data[field['name']] = field.get('value', '')
+        for select in soup.find_all('select'):
+            if not select.get('name'):
+                continue
+            values = [
+                option['value']
+                for option in select.find_all('option')
+                if option.has_attr('selected') and option.has_attr('value')
+            ]
+            if values:
+                data[select['name']] = values
+        return data
+
+    def _submit_form_button(self, table_url, soup, button_name, selections=None):
+        button = next(
+            (
+                item
+                for item in soup.find_all('input')
+                if button_name in (item.get('name') or '')
+            ),
+            None,
+        )
+        if not button:
+            raise ValueError(f'Could not find form button {button_name}')
+        data = self._get_form_data(soup)
+        data.update(selections or {})
+        data[button['name']] = button.get('value', '')
+        response = self.session.post(table_url, data=data, timeout=self.timeout)
+        response.raise_for_status()
+        return response, BeautifulSoup(response.content, 'html.parser')
+
+    def _select_large_values(self, table_url):
+        response, soup = self._get_table_page(table_url)
+        processed_targets = set()
+        for _ in range(10):
+            advanced = None
+            for link in soup.find_all('a'):
+                if 'Advanced search' not in link.get_text():
+                    continue
+                href = link.get('href', '')
+                args = href.split("'")
+                if 'javascript:__doPostBack' not in href or len(args) < 4:
+                    raise ValueError('Could not open advanced variable search')
+                if args[1] not in processed_targets:
+                    advanced = link
+                    break
+            if not advanced:
+                return response, soup
+            processed_targets.add(args[1])
+            data = self._get_form_data(soup)
+            data['__EVENTTARGET'] = args[1]
+            data['__EVENTARGUMENT'] = ''
+            response = self.session.post(response.url, data=data, timeout=self.timeout)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            response, soup = self._submit_form_button(
+                response.url,
+                soup,
+                'FetchAllButton',
+            )
+            results = next(
+                (
+                    select
+                    for select in soup.find_all('select')
+                    if 'SearchResults' in (select.get('name') or '')
+                ),
+                None,
+            )
+            if results and results.find_all('option'):
+                response, soup = self._submit_form_button(
+                    response.url,
+                    soup,
+                    'MoveToResultButton',
+                    {
+                        results['name']: [
+                            option['value'] for option in results.find_all('option')
+                        ],
+                    },
+                )
+            selected = next(
+                (
+                    select
+                    for select in soup.find_all('select')
+                    if 'SelectedVariableValues' in (select.get('name') or '')
+                ),
+                None,
+            )
+            if not selected or not selected.find_all('option'):
+                raise ValueError('Advanced search returned no variable values')
+            response, soup = self._submit_form_button(
+                response.url,
+                soup,
+                'DoneButton',
+                {
+                    selected['name']: [
+                        option['value'] for option in selected.find_all('option')
+                    ],
+                },
+            )
+        raise ValueError('Too many large variables in table')
+
+    def _get_large_table_data(self, table_url, file_format, max_cells=100000):
+        response, soup = self._select_large_values(table_url)
+        selects = [
+            select
+            for select in soup.find_all('select')
+            if select.get('name') and select.find_all('option')
+        ]
+        if not selects:
+            raise ValueError('No variable values available for large-table export')
+        values = [
+            [option['value'] for option in select.find_all('option')]
+            for select in selects
+        ]
+        total_cells = math.prod(len(variable_values) for variable_values in values)
+        chunk_index = len(selects) - 1
+        requested = file_format.strip().lower()
+        merge_formats = {
+            'csv': self._merge_csv_chunks,
+            'comma delimited with heading': self._merge_csv_chunks,
+            'json-stat2': self._merge_json_stat2_chunks,
+            'json-stat 2 file (json)': self._merge_json_stat2_chunks,
+            'excel': self._merge_xlsx_chunks,
+            'excel-xlsx': self._merge_xlsx_chunks,
+            'excel (xlsx)': self._merge_xlsx_chunks,
+        }
+        if total_cells <= max_cells:
+            chunks = [values[chunk_index]]
+        else:
+            if requested not in merge_formats:
+                raise ValueError(
+                    'Chunked large-table export supports only CSV, XLSX, and JSON-stat 2'
+                )
+            chunk_size = None
+            for index in range(len(selects) - 1, -1, -1):
+                other_cells = math.prod(
+                    len(variable_values)
+                    for variable_index, variable_values in enumerate(values)
+                    if variable_index != index
+                )
+                if other_cells <= max_cells:
+                    chunk_index = index
+                    chunk_size = max_cells // other_cells
+                    break
+            if not chunk_size:
+                raise ValueError('Cannot split table below the 100,000-cell source limit')
+            if chunk_index != len(selects) - 1:
+                raise ValueError('Chunked export requires splitting the last table dimension')
+            chunks = [
+                values[chunk_index][start:start + chunk_size]
+                for start in range(0, len(values[chunk_index]), chunk_size)
+            ]
+
+        contents = []
+        for chunk in chunks:
+            selections = {
+                select['name']: variable_values
+                for select, variable_values in zip(selects, values)
             }
-            
-            logger.info(f"Download POST data: {download_data}")
-            
-            download_response = self.session.post(table_url, data=download_data)
-            download_response.raise_for_status()
-            
-            return download_response.content
+            selections[selects[chunk_index]['name']] = chunk
+            post_response, result_soup = self._submit_form_button(
+                response.url,
+                soup,
+                'ButtonViewTable',
+                selections,
+            )
+            contents.append(self._download_format(post_response, result_soup, file_format))
+        if len(contents) == 1:
+            return contents[0]
+        return merge_formats[requested](contents)
+
+    @staticmethod
+    def _merge_csv_chunks(contents):
+        tables = []
+        for content in contents:
+            rows = list(csv.reader(StringIO(content.decode('utf-8-sig'))))
+            if len(rows) < 4:
+                raise ValueError('Invalid CSV chunk returned by Statbank')
+            title, header, data = rows[0], rows[2], rows[3:]
+            if not header or any(len(row) != len(header) for row in data):
+                raise ValueError('Inconsistent CSV chunk returned by Statbank')
+            tables.append((title, header, data))
+
+        first_header = tables[0][1]
+        if len(set(first_header)) != len(first_header):
+            raise ValueError('Cannot merge CSV chunks with duplicate column names')
+        shared_headers = set(first_header).intersection(
+            *(set(header) for _, header, _ in tables[1:])
+        )
+        key_columns = [column for column in first_header if column in shared_headers]
+        if not key_columns:
+            raise ValueError('Cannot identify shared columns between CSV chunks')
+        combined_header = list(first_header)
+        combined_rows = [list(row) for row in tables[0][2]]
+        first_keys = [
+            [row[first_header.index(column)] for column in key_columns]
+            for row in tables[0][2]
+        ]
+        for title, header, rows in tables[1:]:
+            if title != tables[0][0] or len(rows) != len(combined_rows):
+                raise ValueError('CSV chunks do not describe the same table rows')
+            if len(set(header)) != len(header):
+                raise ValueError('Cannot merge CSV chunks with duplicate column names')
+            keys = [
+                [row[header.index(column)] for column in key_columns]
+                for row in rows
+            ]
+            if keys != first_keys:
+                raise ValueError('CSV chunks have different row ordering or dimensions')
+            extra_indices = [
+                index
+                for index, column in enumerate(header)
+                if column not in key_columns
+            ]
+            if not extra_indices:
+                raise ValueError('CSV chunks do not contain additional data columns')
+            combined_header.extend(header[index] for index in extra_indices)
+            for combined_row, row in zip(combined_rows, rows):
+                combined_row.extend(row[index] for index in extra_indices)
+
+        output = StringIO()
+        writer = csv.writer(output, lineterminator='\r\n')
+        writer.writerow(tables[0][0])
+        writer.writerow([])
+        writer.writerow(combined_header)
+        writer.writerows(combined_rows)
+        return output.getvalue().encode('utf-8-sig')
+
+    @staticmethod
+    def _merge_json_stat2_chunks(contents):
+        datasets = [json.loads(content) for content in contents]
+        first = datasets[0]
+        if not first.get('id') or not first.get('size') or len(first['id']) != len(first['size']):
+            raise ValueError('Invalid JSON-stat 2 chunk')
+        dimension_id = first['id'][-1]
+        for dataset in datasets[1:]:
+            if dataset.get('id') != first['id']:
+                raise ValueError('JSON-stat 2 chunks have different dimensions')
+            for key in set(first) | set(dataset):
+                if key not in {'dimension', 'size', 'value', 'status'}:
+                    if first.get(key) != dataset.get(key):
+                        raise ValueError(f'JSON-stat 2 chunks differ in {key}')
+            for index, current_id in enumerate(first['id'][:-1]):
+                if dataset['size'][index] != first['size'][index]:
+                    raise ValueError('JSON-stat 2 chunks have different dimension sizes')
+                if dataset['dimension'][current_id] != first['dimension'][current_id]:
+                    raise ValueError('JSON-stat 2 chunks have different dimension metadata')
+
+        merged = deepcopy(first)
+        merged['size'][-1] = sum(dataset['size'][-1] for dataset in datasets)
+        combined_index = {}
+        combined_category = {}
+        for dataset in datasets:
+            category = dataset['dimension'][dimension_id]['category']
+            index = category.get('index')
+            if not isinstance(index, dict):
+                raise ValueError('Expected dictionary category indexes in JSON-stat 2')
+            for code, _ in sorted(index.items(), key=lambda item: item[1]):
+                if code in combined_index:
+                    raise ValueError(f'Duplicate category {code} in JSON-stat 2 chunks')
+                combined_index[code] = len(combined_index)
+            for key, value in category.items():
+                if key == 'index':
+                    continue
+                if key not in combined_category:
+                    combined_category[key] = {} if isinstance(value, dict) else [] if isinstance(value, list) else value
+                if isinstance(value, dict):
+                    combined_category[key].update(value)
+                elif isinstance(value, list):
+                    combined_category[key].extend(value)
+                elif combined_category[key] != value:
+                    raise ValueError(f'JSON-stat 2 chunks differ in category {key}')
+        combined_category['index'] = combined_index
+        merged['dimension'][dimension_id]['category'] = combined_category
+
+        for field in ('value', 'status'):
+            if not any(field in dataset for dataset in datasets):
+                continue
+            if all(isinstance(dataset.get(field), list) for dataset in datasets):
+                merged[field] = [
+                    item
+                    for dataset in datasets
+                    for item in dataset[field]
+                ]
+                continue
+            combined_values = {}
+            offset = 0
+            for dataset in datasets:
+                values = dataset.get(field, {})
+                if not isinstance(values, dict):
+                    raise ValueError(f'Cannot combine JSON-stat 2 {field} representations')
+                for key, value in values.items():
+                    combined_values[str(offset + int(key))] = value
+                offset += math.prod(dataset['size'])
+            merged[field] = combined_values
+        return json.dumps(merged, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+    @staticmethod
+    def _merge_xlsx_chunks(contents):
+        workbooks = [load_workbook(BytesIO(content)) for content in contents]
+        sheets = [workbook.active for workbook in workbooks]
+        first = sheets[0]
+        headers = [
+            [sheet.cell(3, column).value for column in range(1, sheet.max_column + 1)]
+            for sheet in sheets
+        ]
+        key_counts = []
+        for header in headers:
+            key_count = next(
+                (index for index, value in enumerate(header) if value not in (None, '')),
+                len(header),
+            )
+            if not key_count or key_count == len(header):
+                raise ValueError('Cannot identify dimension and data columns in XLSX chunks')
+            if len(set(header[key_count:])) != len(header[key_count:]):
+                raise ValueError('Cannot merge XLSX chunks with duplicate data columns')
+            key_counts.append(key_count)
+        if len(set(key_counts)) != 1:
+            raise ValueError('XLSX chunks have different dimension column counts')
+        key_count = key_counts[0]
+        if any(sheet.max_row != first.max_row for sheet in sheets[1:]):
+            raise ValueError('XLSX chunks have different row counts')
+        first_keys = [
+            tuple(first.cell(row, column).value for column in range(1, key_count + 1))
+            for row in range(4, first.max_row + 1)
+        ]
+        for sheet in sheets[1:]:
+            if sheet.cell(1, 1).value != first.cell(1, 1).value:
+                raise ValueError('XLSX chunks have different table titles')
+            keys = [
+                tuple(sheet.cell(row, column).value for column in range(1, key_count + 1))
+                for row in range(4, sheet.max_row + 1)
+            ]
+            if keys != first_keys:
+                raise ValueError('XLSX chunks have different row ordering or dimensions')
+            extra_indices = range(key_count + 1, sheet.max_column + 1)
+            target_start = first.max_column + 1
+            for offset, source_index in enumerate(extra_indices):
+                target_index = target_start + offset
+                for row in range(3, first.max_row + 1):
+                    source = sheet.cell(row, source_index)
+                    destination = first.cell(row, target_index)
+                    destination.value = source.value
+                    if source.has_style:
+                        destination._style = copy(source._style)
+                source_letter = get_column_letter(source_index)
+                target_letter = get_column_letter(target_index)
+                first.column_dimensions[target_letter].width = sheet.column_dimensions[source_letter].width
+
+        output = BytesIO()
+        workbooks[0].save(output)
+        for workbook in workbooks:
+            workbook.close()
+        return output.getvalue()
+
+    @staticmethod
+    def _get_format_options(result_soup):
+        options = []
+        for label in result_soup.find_all('label'):
+            input_id = label.get('for', '')
+            if 'SaveAsRadioButtonList' not in input_id:
+                continue
+            radio = result_soup.find('input', id=input_id)
+            if radio and radio.get('value'):
+                options.append((label.get_text(strip=True), radio['value']))
+        return options
+
+    def _download_format(self, post_response, result_soup, file_format):
+        options = self._get_format_options(result_soup)
+        requested = file_format.strip().lower()
+        expected_label = self.FORMAT_ALIASES.get(requested)
+        target_value = None
+        for label, value in options:
+            if label.lower() == requested or label == expected_label:
+                target_value = value
+                break
+
+        if not target_value:
+            available = ', '.join(label for label, _ in options)
+            aliases = ', '.join(sorted(self.FORMAT_ALIASES))
+            raise ValueError(
+                f"Format '{file_format}' not found. "
+                f'Available aliases: {aliases}. Available formats: {available}'
+            )
+
+        download_url = urljoin(post_response.url, target_value)
+        logger.info('Downloading format: %s', file_format)
+        response = self.session.get(download_url, timeout=self.timeout)
+        response.raise_for_status()
+        return response.content

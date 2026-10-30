@@ -10,6 +10,7 @@ setup(
         'click',
         'pandas',
         'lxml',
+        'openpyxl',
     ],
     entry_points={
         'console_scripts': [
