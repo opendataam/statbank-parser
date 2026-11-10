@@ -40,6 +40,10 @@ Tests for the `StatbankScraper` class:
 - **test_large_table_within_limit_selects_every_value**: Tests complete selection for large tables within the cell limit
 - **test_large_table_chunks_and_merges_csv_without_losing_values**: Tests chunked export, shared dimensions, and preservation of `..` values
 - **test_merge_json_stat2_chunks_preserves_values_and_sparse_status**: Tests category merging and sparse-status index offsets
+- **test_large_table_chunks_and_merges_json_stat2_split_on_last_dimension**: Tests that a JSON-stat 2 table split on its last dimension merges back into the unsplit table, cell by cell
+- **test_merge_json_stat2_chunks_matches_unsplit_table_for_any_dimension**: Tests the merge of chunks split on each dimension, with dense and sparse values
+- **test_merge_json_stat2_chunks_rejects_chunks_split_on_several_dimensions**: Tests that chunks that differ in more than one dimension are refused
+- **test_merge_csv_chunks_keeps_value_labels_repeated_between_chunks**: Tests that a category label repeated between chunks stays a data column
 - **test_merge_xlsx_chunks_preserves_headers_rows_and_numbers**: Tests blank dimension headers, row alignment, numbers, and styles
 - **test_get_indicators_initializes_visited_and_deduplicates_urls**: Tests cycle state and URL deduplication
 - **test_traverse_category_prevents_infinite_loops**: Tests cycle prevention

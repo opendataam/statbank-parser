@@ -1,6 +1,7 @@
 import json
 import unittest
 from io import BytesIO
+from itertools import product
 from unittest.mock import Mock, patch
 from urllib.parse import quote
 
@@ -45,6 +46,61 @@ def make_response(content, url):
     response.url = url
     response.raise_for_status = Mock()
     return response
+
+
+JSON_STAT2_DIMENSIONS = (
+    ('regions', ['Total', 'North', 'South']),
+    ('indicators', ['Output', 'Index']),
+    # Statbank tables can repeat a category label for different codes.
+    ('years', ['2006', '2025', '2007', '2008', '2025']),
+)
+
+
+def json_stat2_table(selection=None, sparse=False):
+    """Build a JSON-stat 2 table whose values identify their cell."""
+    selection = selection or {}
+    ids = [dimension_id for dimension_id, _ in JSON_STAT2_DIMENSIONS]
+    codes = {
+        dimension_id: selection.get(
+            dimension_id,
+            [str(index) for index in range(len(labels))],
+        )
+        for dimension_id, labels in JSON_STAT2_DIMENSIONS
+    }
+    dimension = {
+        dimension_id: {
+            'label': dimension_id,
+            'category': {
+                'index': {code: index for index, code in enumerate(codes[dimension_id])},
+                'label': {code: labels[int(code)] for code in codes[dimension_id]},
+            },
+        }
+        for dimension_id, labels in JSON_STAT2_DIMENSIONS
+    }
+    values = []
+    status = {}
+    for index, cell in enumerate(product(*(codes[dimension_id] for dimension_id in ids))):
+        region, indicator, year = (int(code) for code in cell)
+        if (region + indicator + year) % 3 == 0:
+            values.append(None)
+            status[str(index)] = '..'
+        else:
+            values.append(region * 100 + indicator * 10 + year + 0.5)
+    return {
+        'version': '2.0',
+        'class': 'dataset',
+        'label': 'Large table',
+        'updated': '2026-01-01T00:00:00Z',
+        'id': ids,
+        'size': [len(codes[dimension_id]) for dimension_id in ids],
+        'dimension': dimension,
+        'value': (
+            {str(index): value for index, value in enumerate(values) if value is not None}
+            if sparse
+            else values
+        ),
+        'status': status,
+    }
 
 
 class TestStatbankScraper(unittest.TestCase):
@@ -449,6 +505,85 @@ class TestStatbankScraper(unittest.TestCase):
         category = merged['dimension']['years']['category']
         self.assertEqual(category['index'], {'2023': 0, '2024': 1, '2025': 2})
         self.assertEqual(category['label']['2025'], '2025')
+
+    def test_large_table_chunks_and_merges_json_stat2_split_on_last_dimension(self):
+        main = BeautifulSoup(
+            '<form><select name="regions">'
+            + ''.join(f'<option value="{code}"/>' for code in range(3))
+            + '</select><select name="indicators">'
+            + ''.join(f'<option value="{code}"/>' for code in range(2))
+            + '</select><select name="years">'
+            + ''.join(f'<option value="{code}"/>' for code in range(5))
+            + '</select></form>',
+            'html.parser',
+        )
+        chunks = [['0', '1'], ['2', '3'], ['4']]
+
+        with patch.object(
+            self.scraper,
+            '_select_large_values',
+            return_value=(self.initial_response, main),
+        ), patch.object(
+            self.scraper,
+            '_submit_form_button',
+            return_value=(self.result_response, self.result_soup),
+        ) as mock_submit, patch.object(
+            self.scraper,
+            '_download_format',
+            side_effect=[
+                json.dumps(json_stat2_table({'years': chunk})).encode()
+                for chunk in chunks
+            ],
+        ):
+            result = self.scraper._get_large_table_data(
+                self.test_url,
+                'json-stat2',
+                max_cells=15,
+            )
+
+        self.assertEqual(
+            [call.args[3]['years'] for call in mock_submit.call_args_list],
+            chunks,
+        )
+        self.assertEqual(json.loads(result), json_stat2_table())
+
+    def test_merge_json_stat2_chunks_matches_unsplit_table_for_any_dimension(self):
+        for dimension_id, labels in JSON_STAT2_DIMENSIONS:
+            codes = [str(index) for index in range(len(labels))]
+            for sparse in (False, True):
+                with self.subTest(dimension=dimension_id, sparse=sparse):
+                    chunks = [
+                        json.dumps(json_stat2_table({dimension_id: part}, sparse)).encode()
+                        for part in (codes[:1], codes[1:])
+                    ]
+
+                    merged = json.loads(self.scraper._merge_json_stat2_chunks(chunks))
+
+                    self.assertEqual(merged, json_stat2_table(sparse=sparse))
+
+    def test_merge_json_stat2_chunks_rejects_chunks_split_on_several_dimensions(self):
+        chunks = [
+            json.dumps(json_stat2_table({'regions': ['0'], 'years': ['0']})).encode(),
+            json.dumps(json_stat2_table({'regions': ['1'], 'years': ['1']})).encode(),
+        ]
+
+        with self.assertRaisesRegex(ValueError, 'exactly one dimension'):
+            self.scraper._merge_json_stat2_chunks(chunks)
+
+    def test_merge_csv_chunks_keeps_value_labels_repeated_between_chunks(self):
+        def csv_chunk(years, rows):
+            lines = ['"Large table"', '', ','.join(['regions', 'indicators'] + years)]
+            lines.extend(','.join(row) for row in rows)
+            return ('\r\n'.join(lines) + '\r\n').encode('utf-8')
+
+        result = self.scraper._merge_csv_chunks([
+            csv_chunk(['2006', '2025', '2007'], [['A', 'x', '1', '..', '2'], ['B', 'x', '3', '..', '4']]),
+            csv_chunk(['2024', '2025'], [['A', 'x', '5', '6'], ['B', 'x', '7', '8']]),
+        ])
+
+        rows = result.decode('utf-8-sig').splitlines()
+        self.assertEqual(rows[2], 'regions,indicators,2006,2025,2007,2024,2025')
+        self.assertEqual(rows[3:], ['A,x,1,..,2,5,6', 'B,x,3,..,4,7,8'])
 
     def test_merge_xlsx_chunks_preserves_headers_rows_and_numbers(self):
         def workbook_chunk(years, rows):

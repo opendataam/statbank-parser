@@ -400,41 +400,38 @@ class StatbankScraper:
             tables.append((title, header, data))
 
         first_header = tables[0][1]
-        if len(set(first_header)) != len(first_header):
-            raise ValueError('Cannot merge CSV chunks with duplicate column names')
-        shared_headers = set(first_header).intersection(
-            *(set(header) for _, header, _ in tables[1:])
-        )
-        key_columns = [column for column in first_header if column in shared_headers]
-        if not key_columns:
+        # The leading stub columns are repeated in every chunk; the remaining
+        # heading columns hold the values of the split dimension. Value labels
+        # can repeat between chunks (Statbank has tables with two categories
+        # labelled with the same year), so stub columns are the common header
+        # prefix rather than every shared column name.
+        key_count = 0
+        while (
+            key_count < len(first_header)
+            and all(
+                key_count < len(header) - 1
+                and header[key_count] == first_header[key_count]
+                for _, header, _ in tables
+            )
+        ):
+            key_count += 1
+        if not key_count:
             raise ValueError('Cannot identify shared columns between CSV chunks')
+        key_columns = first_header[:key_count]
+        if len(set(key_columns)) != len(key_columns):
+            raise ValueError('Cannot merge CSV chunks with duplicate column names')
         combined_header = list(first_header)
         combined_rows = [list(row) for row in tables[0][2]]
-        first_keys = [
-            [row[first_header.index(column)] for column in key_columns]
-            for row in tables[0][2]
-        ]
+        first_keys = [row[:key_count] for row in tables[0][2]]
         for title, header, rows in tables[1:]:
             if title != tables[0][0] or len(rows) != len(combined_rows):
                 raise ValueError('CSV chunks do not describe the same table rows')
-            if len(set(header)) != len(header):
-                raise ValueError('Cannot merge CSV chunks with duplicate column names')
-            keys = [
-                [row[header.index(column)] for column in key_columns]
-                for row in rows
-            ]
+            keys = [row[:key_count] for row in rows]
             if keys != first_keys:
                 raise ValueError('CSV chunks have different row ordering or dimensions')
-            extra_indices = [
-                index
-                for index, column in enumerate(header)
-                if column not in key_columns
-            ]
-            if not extra_indices:
-                raise ValueError('CSV chunks do not contain additional data columns')
-            combined_header.extend(header[index] for index in extra_indices)
+            combined_header.extend(header[key_count:])
             for combined_row, row in zip(combined_rows, rows):
-                combined_row.extend(row[index] for index in extra_indices)
+                combined_row.extend(row[key_count:])
 
         output = StringIO()
         writer = csv.writer(output, lineterminator='\r\n')
@@ -448,9 +445,13 @@ class StatbankScraper:
     def _merge_json_stat2_chunks(contents):
         datasets = [json.loads(content) for content in contents]
         first = datasets[0]
-        if not first.get('id') or not first.get('size') or len(first['id']) != len(first['size']):
-            raise ValueError('Invalid JSON-stat 2 chunk')
-        dimension_id = first['id'][-1]
+        for dataset in datasets:
+            if (
+                not dataset.get('id')
+                or not dataset.get('size')
+                or len(dataset['id']) != len(dataset['size'])
+            ):
+                raise ValueError('Invalid JSON-stat 2 chunk')
         for dataset in datasets[1:]:
             if dataset.get('id') != first['id']:
                 raise ValueError('JSON-stat 2 chunks have different dimensions')
@@ -458,14 +459,25 @@ class StatbankScraper:
                 if key not in {'dimension', 'size', 'value', 'status'}:
                     if first.get(key) != dataset.get(key):
                         raise ValueError(f'JSON-stat 2 chunks differ in {key}')
-            for index, current_id in enumerate(first['id'][:-1]):
-                if dataset['size'][index] != first['size'][index]:
+        # Chunks are requested by splitting the values of one dimension, so
+        # exactly that dimension differs between them.
+        split_dimensions = {
+            current_id
+            for dataset in datasets[1:]
+            for current_id in first['id']
+            if dataset['dimension'].get(current_id) != first['dimension'].get(current_id)
+        }
+        if len(split_dimensions) != 1:
+            raise ValueError('JSON-stat 2 chunks must differ in exactly one dimension')
+        dimension_id = split_dimensions.pop()
+        split = first['id'].index(dimension_id)
+        for dataset in datasets[1:]:
+            for index, size in enumerate(first['size']):
+                if index != split and dataset['size'][index] != size:
                     raise ValueError('JSON-stat 2 chunks have different dimension sizes')
-                if dataset['dimension'][current_id] != first['dimension'][current_id]:
-                    raise ValueError('JSON-stat 2 chunks have different dimension metadata')
 
         merged = deepcopy(first)
-        merged['size'][-1] = sum(dataset['size'][-1] for dataset in datasets)
+        merged['size'][split] = sum(dataset['size'][split] for dataset in datasets)
         combined_index = {}
         combined_category = {}
         for dataset in datasets:
@@ -491,26 +503,58 @@ class StatbankScraper:
         combined_category['index'] = combined_index
         merged['dimension'][dimension_id]['category'] = combined_category
 
+        # JSON-stat 2 values are in row-major order (the last dimension varies
+        # fastest). For every combination of the dimensions before the split
+        # one, each chunk holds one contiguous block of
+        # chunk_size * inner_cells values, and the merged dataset holds the
+        # blocks of all chunks one after another.
+        inner_cells = math.prod(first['size'][split + 1:])
+        merged_block = merged['size'][split] * inner_cells
+        blocks = []
+        offset = 0
+        for dataset in datasets:
+            blocks.append((offset * inner_cells, dataset['size'][split] * inner_cells))
+            offset += dataset['size'][split]
+        total_cells = math.prod(merged['size'])
+
         for field in ('value', 'status'):
             if not any(field in dataset for dataset in datasets):
                 continue
+            for dataset in datasets:
+                values = dataset.get(field)
+                if isinstance(values, list) and len(values) != math.prod(dataset['size']):
+                    raise ValueError(f'JSON-stat 2 chunk {field} does not match its size')
+                if values is not None and not isinstance(values, (list, dict)):
+                    raise ValueError(f'Cannot combine JSON-stat 2 {field} representations')
             if all(isinstance(dataset.get(field), list) for dataset in datasets):
-                merged[field] = [
-                    item
-                    for dataset in datasets
-                    for item in dataset[field]
-                ]
+                combined_list = [None] * total_cells
+                for dataset, (start, length) in zip(datasets, blocks):
+                    values = dataset[field]
+                    for row in range(len(values) // length):
+                        target = row * merged_block + start
+                        combined_list[target:target + length] = values[
+                            row * length:(row + 1) * length
+                        ]
+                merged[field] = combined_list
                 continue
             combined_values = {}
-            offset = 0
-            for dataset in datasets:
-                values = dataset.get(field, {})
-                if not isinstance(values, dict):
-                    raise ValueError(f'Cannot combine JSON-stat 2 {field} representations')
+            for dataset, (start, length) in zip(datasets, blocks):
+                values = dataset.get(field) or {}
+                if isinstance(values, list):
+                    values = {
+                        str(index): value
+                        for index, value in enumerate(values)
+                        if value is not None
+                    }
                 for key, value in values.items():
-                    combined_values[str(offset + int(key))] = value
-                offset += math.prod(dataset['size'])
-            merged[field] = combined_values
+                    if not 0 <= int(key) < math.prod(dataset['size']):
+                        raise ValueError(f'JSON-stat 2 chunk {field} index {key} is out of range')
+                    row, position = divmod(int(key), length)
+                    combined_values[row * merged_block + start + position] = value
+            merged[field] = {
+                str(key): combined_values[key]
+                for key in sorted(combined_values)
+            }
         return json.dumps(merged, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
     @staticmethod
